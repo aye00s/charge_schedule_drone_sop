@@ -1,0 +1,4 @@
+n,m,t_crossover_R1,t_crossover_R1_lo,t_crossover_R1_hi,t_crossover_R3a,t_crossover_R3a_lo,t_crossover_R3a_hi,L_crossover_R1_replication_only,L_crossover_R3a_replication_only,total_queue_crossover_analytic
+4,6,,,,,,,0.7069464357508645,,0.749999999627471
+5,7,,,,,,,0.7503896936197885,,0.7999999995343388
+10,9,,,,,,,0.8261911984791325,,0.899999999627471

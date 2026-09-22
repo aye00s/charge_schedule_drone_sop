@@ -1,0 +1,9 @@
+n_drones,pads,horizon_min,milp_status,milp_obj,heur_status,heur_obj,gap
+4,"[1, 1]",60,Optimal,5.0,Heuristic,5,0.0
+6,"[1, 1]",90,Optimal,8.0,Heuristic,8,0.0
+8,"[1, 1]",120,Optimal,13.0,Heuristic,13,0.0
+8,"[2, 1]",120,Optimal,14.0,Heuristic,14,0.0
+10,"[1, 1, 1]",120,Optimal,18.0,Heuristic,18,0.0
+10,"[1, 1]",100,Optimal,18.0,Heuristic,18,0.0
+12,"[2, 1]",150,Optimal,20.0,Heuristic,20,0.0
+6,[1],90,Infeasible,,Infeasible,,
