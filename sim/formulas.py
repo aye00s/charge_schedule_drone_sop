@@ -81,8 +81,15 @@ def time_to_ready_cost(tau_ij: float, free_time_by_pad: list, t: float, s_arr: f
     if use_queue_term:
         W_j, start, best_pad = deterministic_wait(free_time_by_pad, t_arr)
     else:
-        W_j, start, best_pad = 0.0, t_arr, min(range(len(free_time_by_pad)),
-                                                key=lambda p: free_time_by_pad[p])
+        # B3 ("nearest-time greedy"): drop W_j from the ranking COST between
+        # stations, but pad occupancy (C1) must still be respected -- the
+        # chosen pad's actual free time is a floor on start, not something
+        # this ablation is allowed to ignore. Bug found 2026-09-23: this
+        # branch used to set start=t_arr unconditionally, letting unlimited
+        # drones "charge" concurrently at one pad. See CLAUDE.md Section 13.
+        best_pad = min(range(len(free_time_by_pad)), key=lambda p: free_time_by_pad[p])
+        start = max(t_arr, free_time_by_pad[best_pad])
+        W_j = 0.0
     T_chg = time_to_reach_target_min(s_arr, s_tgt, battery_wh) if use_charge_time_term else 0.0
     return tau_ij + W_j + T_chg, W_j, start, best_pad
 

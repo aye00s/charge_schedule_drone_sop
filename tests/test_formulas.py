@@ -207,6 +207,33 @@ def test_F12_drain_period_reports_unfinished_at_cap():
     assert r_drained["unfinished_at_cap"] == 0
 
 
+def test_x5_energy_decomposition_conserves_energy_exactly():
+    """X5's energy decomposition (mission flight + station trips + change
+    in stored charge) must satisfy an exact conservation identity:
+    end_of_run_stored_charge_change_wh == total_charge_energy_ticked_wh
+    - mission_flight_energy_wh - station_trip_energy_wh. Found (2026-09-23)
+    that using `total_charge_energy_wh` (completed-sessions-only) in this
+    identity leaves a real, nonzero gap whenever a drone is still
+    mid-charge when the run ends -- drain_cap_min only waits for MISSIONS
+    to finish, not charge sessions in progress, so a charging session can
+    legitimately outlive the last mission and never get tallied into the
+    completed-only field. `total_charge_energy_ticked_wh` (ticks up every
+    tick regardless of session completion) closes the identity exactly;
+    checked here across all three policies and several fleet sizes,
+    deliberately with a drain cap enabled (drain_cap_min=500) so this
+    isn't just checked in the no-boundary-effect case."""
+    STATIONS = [(300, 300), (1700, 300), (1000, 1000), (300, 1700), (1700, 1700)]
+    for policy_kwargs in [dict(policy="baseline"), dict(policy="jsq"), dict(policy="ours")]:
+        for n in (2, 5, 10):
+            r = run_mission_sim(n_uavs=n, station_positions=STATIONS, pads_per_station=2,
+                                 horizon_min=300, seed=1, mission_rate_per_min=0.3,
+                                 drain_cap_min=500.0, **policy_kwargs)
+            lhs = r["end_of_run_stored_charge_change_wh"]
+            rhs = (r["total_charge_energy_ticked_wh"] - r["mission_flight_energy_wh"]
+                   - r["station_trip_energy_wh"])
+            assert abs(lhs - rhs) < 1e-6, f"{policy_kwargs}, n={n}: identity off by {lhs - rhs}"
+
+
 def test_mean_on_pad_queue_length_hand_verified():
     """Pre-X3 requirement (2026-09-22): on-pad queue length, time-integrated,
     needed to interpret F14 (JIT should reduce this toward 0 without

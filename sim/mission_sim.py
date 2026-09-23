@@ -166,7 +166,10 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                      use_jit: bool = False, use_charge_time_term: bool = True,
                      initial_soc: float = 1.0, initial_positions: list = None,
                      drain_cap_min: float = 0.0,
-                     alpha: float = 1.0, beta: float = 1.0, gamma: float = 1.0) -> dict:
+                     alpha: float = 1.0, beta: float = 1.0, gamma: float = 1.0,
+                     collect_dispatch_diagnostics: bool = False,
+                     f9_priority_insertion: bool = False,
+                     f9_lookahead_cap_min: float = None) -> dict:
     """policy: 'baseline' (default, backward compatible), 'jsq' (B4), or
     'ours' (the full heuristic, Section 3) -- see the module docstring.
 
@@ -213,10 +216,13 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
 
     ours_only = dict(w1=w1, w2=w2, use_queue_term=use_queue_term, use_reservation=use_reservation,
                       use_priority=use_priority, use_partial=use_partial, use_jit=use_jit,
-                      use_charge_time_term=use_charge_time_term)
+                      use_charge_time_term=use_charge_time_term,
+                      f9_priority_insertion=f9_priority_insertion,
+                      f9_lookahead_cap_min=f9_lookahead_cap_min)
     ours_only_defaults = dict(w1=1.0, w2=1.0, use_queue_term=True, use_reservation=True,
                                use_priority=True, use_partial=True, use_jit=False,
-                               use_charge_time_term=True)
+                               use_charge_time_term=True, f9_priority_insertion=False,
+                               f9_lookahead_cap_min=None)
     if policy != "ours":
         bad = [k for k, v in ours_only.items() if v != ours_only_defaults[k]]
         if bad:
@@ -271,10 +277,21 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
     request_times = []
     total_cost_usd = 0.0
     mission_flight_energy_wh = 0.0
+    station_trip_energy_wh = 0.0  # X5 energy decomposition (2026-09-23)
+    # `total_charge_energy_wh` (below) only sums COMPLETED sessions; a
+    # drone can still be mid-charge when the loop exits (drain_cap_min
+    # only waits for missions to complete, not charge sessions in
+    # progress), silently under-counting it -- found via a real,
+    # nonzero energy-conservation-identity check. This ticks up EVERY
+    # tick regardless of session completion, closing the identity
+    # exactly (see test_x5_energy_decomposition_conserves_energy_exactly).
+    total_charge_energy_ticked_wh = 0.0
     gate_evaluations = 0  # F5 reachability-gate binding rate (Section 12's
     gate_refusals = 0     # pitfall: "if the gate never binds, log it"), same
                            # counters used by every policy for a uniform metric
     stampede_station_counts = []  # only populated by policy='ours'
+    reservations_created = 0  # F9 lifecycle audit (2026-09-22 root-cause diagnostic)
+    dispatch_diagnostics = []  # only populated when collect_dispatch_diagnostics=True
     next_mission_idx = 0
     max_dist_per_tick = SPEED_MPS * DT_MIN * 60.0
 
@@ -382,6 +399,8 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 uav.position = new_pos
                 if uav.state == "FLYING_MISSION":
                     mission_flight_energy_wh += energy_wh
+                else:  # FLYING_TO_STATION -- X5 energy decomposition (2026-09-23)
+                    station_trip_energy_wh += energy_wh
                 if uav.soc < SIGMA - 1e-6:
                     safety_violations += 1
                 if arrived:
@@ -417,6 +436,7 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 uav.soc = new_soc
                 energy_this_tick_wh = (new_soc - soc_before_tick) * uav.battery_wh
                 total_cost_usd += energy_this_tick_wh * rate_fn(t)
+                total_charge_energy_ticked_wh += energy_this_tick_wh
                 if uav.soc >= uav.charge_target - 1e-6:
                     st = stations[uav.station_id]
                     req_t = request_time_by_uav.get(uav.id)
@@ -519,6 +539,8 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 uav.position = new_pos
                 if uav.state == "FLYING_MISSION":
                     mission_flight_energy_wh += energy_wh
+                else:  # FLYING_TO_STATION -- X5 energy decomposition (2026-09-23)
+                    station_trip_energy_wh += energy_wh
                 if uav.soc < SIGMA - 1e-6:
                     safety_violations += 1
                 if arrived:
@@ -550,6 +572,7 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 uav.soc = new_soc
                 energy_this_tick_wh = (new_soc - soc_before_tick) * uav.battery_wh
                 total_cost_usd += energy_this_tick_wh * rate_fn(t)
+                total_charge_energy_ticked_wh += energy_this_tick_wh
                 if uav.soc >= uav.charge_target - 1e-6:
                     st = stations[uav.station_id]
                     req_t = request_time_by_uav.get(uav.id)
@@ -653,15 +676,104 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 # predicted start must also land on a tick boundary, or the
                 # NEXT drone's F7 prediction inherits the same drift.
                 T_chg = _ceil_to_tick(T_chg_raw) if T_chg_raw > 0 else 0.0
-                end = best_start + T_chg
-                if use_reservation:
-                    free_time[best_j][best_pad] = end  # F9: update BEFORE the next drone this epoch
+                earliest_arrival = t + tau_star  # earliest this drone's OWN travel allows pad occupancy
+
+                # F9 variant (b), 2026-09-23 (root-cause investigation of the
+                # X3 density_scarce finding -- priority inversion, see
+                # CLAUDE.md Section 13): refuse to commit this far ahead;
+                # defer to a later epoch instead, when the queue picture may
+                # have changed. Off by default (None = no cap, current
+                # behaviour, X3's result stands as reported).
+                if f9_lookahead_cap_min is not None and (best_start - t) > f9_lookahead_cap_min:
+                    continue
+
+                # Priority-inversion diagnostic (2026-09-23): F9 chains every
+                # new reservation onto the END of its pad's existing queue
+                # regardless of priority, so service order across epochs is
+                # FCFS-by-reservation-time -- F10/F11 only order drones
+                # WITHIN one epoch. Count how many currently-pending
+                # reservations at this exact pad (all of them are, by
+                # construction of the default free_time chain, ahead of this
+                # one) have LOWER priority than this drone.
+                ahead_lower_priority = sum(
+                    1 for other_id, other_res in reservation.items()
+                    if other_res["station"] == best_j and other_res["pad"] == best_pad
+                    and other_res["priority"] < prio
+                )
+                ahead_total = sum(
+                    1 for other_id, other_res in reservation.items()
+                    if other_res["station"] == best_j and other_res["pad"] == best_pad
+                )
+
+                if f9_priority_insertion:
+                    # F9 variant (a), 2026-09-23: a higher-priority drone may
+                    # be inserted ahead of not-yet-started (not yet
+                    # CHARGING) lower-priority reservations at the same pad,
+                    # instead of always going to the back of the queue.
+                    # Reservations already CHARGING cannot be preempted (a
+                    # physical charge in progress can't be interrupted).
+                    uav_by_id = {u.id: u for u in uavs}
+                    pending_at_pad = [(uid, res) for uid, res in reservation.items()
+                                       if res["station"] == best_j and res["pad"] == best_pad]
+                    charging_floor = t
+                    not_yet_started = []
+                    for uid, res in pending_at_pad:
+                        if uav_by_id[uid].state == "CHARGING":
+                            charging_floor = max(charging_floor, res["end"])
+                        else:
+                            not_yet_started.append((uid, res))
+                    not_yet_started.sort(key=lambda item: -item[1]["priority"])
+                    insert_pos = 0
+                    while (insert_pos < len(not_yet_started)
+                           and not_yet_started[insert_pos][1]["priority"] >= prio):
+                        insert_pos += 1
+                    chain = (not_yet_started[:insert_pos] + [(uav.id, None)]
+                             + not_yet_started[insert_pos:])
+
+                    running = charging_floor
+                    for uid, res in chain:
+                        if uid == uav.id:
+                            best_start = max(earliest_arrival, running)
+                            end = best_start + T_chg
+                            running = end
+                        else:
+                            s = max(res["earliest_arrival"], running)
+                            e = s + res["t_chg"]
+                            res["start"], res["end"] = s, e
+                            running = e
+                    if use_reservation:
+                        free_time[best_j][best_pad] = running
+                else:
+                    end = best_start + T_chg
+                    if use_reservation:
+                        free_time[best_j][best_pad] = end  # F9: update BEFORE the next drone this epoch
+
                 dep_time = jit_departure_time(t, best_start, tau_star) if use_jit else t
 
                 reservation[uav.id] = {"station": best_j, "pad": best_pad, "start": best_start,
                                         "end": end, "dep_time": dep_time, "s_tgt": s_tgt,
-                                        "tau": tau_star, "created_at": t}
+                                        "tau": tau_star, "created_at": t, "priority": prio,
+                                        "t_chg": T_chg, "earliest_arrival": earliest_arrival,
+                                        "ahead_lower_priority": ahead_lower_priority,
+                                        "ahead_total": ahead_total}
+                reservations_created += 1
                 this_epoch_stations.append(best_j)
+
+                if collect_dispatch_diagnostics:
+                    # Root-cause diagnostic (2026-09-22): for each dispatch
+                    # decision, record the chosen station vs the nearest
+                    # reachable one, and (once known) the drone's next
+                    # mission destination -- lets us check whether F8 is
+                    # sending drones on detours that don't pay off.
+                    dists = {j: _f_distance(uav.position, station_positions[j]) for j in F_i}
+                    nearest_j = min(dists, key=dists.get)
+                    dispatch_diagnostics.append({
+                        "uav": uav.id, "t": t, "position": uav.position,
+                        "chosen_station": best_j, "dist_to_chosen": dists[best_j],
+                        "nearest_station": nearest_j, "dist_to_nearest": dists[nearest_j],
+                        "is_nearest": best_j == nearest_j,
+                        "completion_position": station_positions[best_j],
+                    })
             if len(this_epoch_stations) > 1:
                 stampede_station_counts.append(this_epoch_stations)
             dispatch_wall_time_s += time.perf_counter() - _dispatch_t0
@@ -703,6 +815,8 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 uav.position = new_pos
                 if uav.state == "FLYING_MISSION":
                     mission_flight_energy_wh += energy_wh
+                else:  # FLYING_TO_STATION -- X5 energy decomposition (2026-09-23)
+                    station_trip_energy_wh += energy_wh
                 if uav.soc < SIGMA - 1e-6:
                     safety_violations += 1
                 if arrived:
@@ -716,7 +830,18 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                         res = reservation[uav.id]
                         uav.dest = None
                         uav.charge_target = res["s_tgt"]
-                        if t + DT_MIN >= res["start"] - 1e-6:
+                        # Physical occupancy backstop (2026-09-23): the F9
+                        # reservation says this drone's slot should be free
+                        # now, but that's only true if free_time was kept
+                        # correctly (use_reservation=True). Without it (or
+                        # under any other scheduling mistake), the engine
+                        # must still never physically over-occupy a pad --
+                        # mirrors baseline/jsq's own pads_busy check, applied
+                        # here as a hard safety net, not a scheduling change.
+                        station_full = sum(
+                            1 for other in uavs if other.state == "CHARGING"
+                            and other.station_id == res["station"]) >= stations[res["station"]].num_pads
+                        if t + DT_MIN >= res["start"] - 1e-6 and not station_full:
                             uav.state = "CHARGING"
                             charge_start_soc[uav.id] = uav.soc
                             charge_start_time[uav.id] = t + DT_MIN
@@ -726,7 +851,11 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
             # --- Step 7: waiting-for-reserved-pad -> charging once start arrives ---
             for uav in uavs:
                 if uav.state == "WAITING_FOR_PAD" and uav.id in reservation:
-                    if t + DT_MIN >= reservation[uav.id]["start"] - 1e-6:
+                    res = reservation[uav.id]
+                    station_full = sum(
+                        1 for other in uavs if other.state == "CHARGING"
+                        and other.station_id == res["station"]) >= stations[res["station"]].num_pads
+                    if t + DT_MIN >= res["start"] - 1e-6 and not station_full:
                         uav.state = "CHARGING"
                         charge_start_soc[uav.id] = uav.soc
                         charge_start_time[uav.id] = t + DT_MIN
@@ -740,6 +869,7 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 new_soc = min(new_soc, uav.charge_target)
                 uav.soc = new_soc
                 total_cost_usd += (new_soc - soc_before) * uav.battery_wh * rate_fn(t)
+                total_charge_energy_ticked_wh += (new_soc - soc_before) * uav.battery_wh
                 if uav.soc >= uav.charge_target - 1e-6:
                     created_at = reservation[uav.id]["created_at"]
                     predicted_start = reservation[uav.id]["start"]
@@ -757,6 +887,10 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                         # derivable, so X6 can consume X3's own session logs
                         # directly instead of every caller re-subtracting.
                         "prediction_error_min": charge_start_time[uav.id] - predicted_start,
+                        # priority-inversion diagnostic (2026-09-23)
+                        "priority": reservation[uav.id]["priority"],
+                        "ahead_lower_priority": reservation[uav.id]["ahead_lower_priority"],
+                        "ahead_total": reservation[uav.id]["ahead_total"],
                     })
                     uav.state = "IDLE"
                     uav.station_id = None
@@ -767,6 +901,25 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
         # this tick's transitions, uniformly for all 3 policies since all of
         # them use the same WAITING_FOR_PAD state.
         on_pad_queue_ticks += sum(1 for uav in uavs if uav.state == "WAITING_FOR_PAD") * DT_MIN
+
+        # Hard capacity invariant (C1), added 2026-09-23 after a real bug
+        # (time_to_ready_cost ignoring pad occupancy under use_queue_term=
+        # False, see CLAUDE.md Section 13) let unlimited drones "charge"
+        # concurrently at one pad and produced a silently-wrong result
+        # instead of a crash. Checked every tick, every policy, every flag
+        # combination -- a violation must fail the run, not the numbers.
+        charging_counts = {}
+        for uav in uavs:
+            if uav.state == "CHARGING":
+                charging_counts[uav.station_id] = charging_counts.get(uav.station_id, 0) + 1
+        for station_id, count in charging_counts.items():
+            cap = stations[station_id].num_pads
+            if count > cap:
+                raise AssertionError(
+                    f"Pad capacity violated (C1): station {station_id} has {count} UAVs "
+                    f"CHARGING simultaneously but only {cap} pads (t={t}, policy={policy!r}, "
+                    f"use_queue_term={use_queue_term})")
+
         final_t = t + DT_MIN
         step += 1
 
@@ -809,10 +962,19 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
         "mean_charge_duration_min": (sum(cs["duration_min"] for cs in charge_sessions) / len(charge_sessions)
                                       if charge_sessions else 0.0),
         "mission_flight_energy_wh": mission_flight_energy_wh,
+        "station_trip_energy_wh": station_trip_energy_wh,
+        "total_charge_energy_ticked_wh": total_charge_energy_ticked_wh,
+        # X5 energy decomposition (2026-09-23): energy equivalent of the
+        # net change in stored battery charge over the run (positive if
+        # the fleet ends with more energy stored than it started with).
+        "end_of_run_stored_charge_change_wh": sum(
+            (uav.soc - initial_soc) * uav.battery_wh for uav in uavs),
         "session_log": charge_sessions,
         "mission_release_times": [m.release_time for m in missions],
         "mission_destinations": [m.destination for m in missions],
         "mission_deadlines": [m.deadline for m in missions],
+        "mission_assigned_uav": [m.assigned_uav for m in missions],
+        "mission_completed_times": [m.completed_time for m in missions],
         "request_times": request_times,
         "gate_binding_rate": (gate_refusals / gate_evaluations) if gate_evaluations > 0 else 0.0,
         "gate_evaluations": gate_evaluations,
@@ -828,6 +990,11 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
     }
     if policy == "ours":
         result["stampede_station_counts"] = stampede_station_counts
+        result["reservations_created"] = reservations_created
+        result["reservations_honoured"] = len(charge_sessions)
+        result["reservations_pending_at_end"] = len(reservation)  # un-honoured at sim end (boundary only)
+        if collect_dispatch_diagnostics:
+            result["dispatch_diagnostics"] = dispatch_diagnostics
     return result
 
 

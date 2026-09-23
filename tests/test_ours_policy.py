@@ -127,3 +127,44 @@ def test_F14_jit_preserves_total_delay_but_removes_onpad_wait():
     # since JIT only changes WHERE the wait happens, not how long it is.
     for a, b in zip(delays_nojit, delays_jit):
         assert abs(a - b) <= 1.0, f"JIT changed total delay: {a} vs {b}"
+
+
+def _summary_metrics(r):
+    """A handful of cheap, broad metrics -- any one of them differing is
+    enough to prove a flag did something observable. Includes
+    mean_on_pad_queue_length specifically because F14/JIT is designed to
+    change WHERE a drone waits (on-pad vs. delayed departure) without
+    changing total_delay_min -- a summary that omitted it would wrongly
+    call JIT a no-op."""
+    delays = [cs["total_delay_min"] for cs in r["session_log"]]
+    return (r["missions_completed"], r["charge_sessions"], round(r["total_charge_energy_wh"], 6),
+            round(r["f12_Z"], 6), r["unfinished_at_cap"],
+            round(sum(delays) / len(delays), 6) if delays else 0.0,
+            round(r["mean_on_pad_queue_length"], 6))
+
+
+def test_every_ablation_flag_changes_observable_behaviour():
+    """REMEDIATION.md guard (2026-09-23, added after use_reservation=False
+    was found to be a provable no-op under B3/use_queue_term=False -- see
+    CLAUDE.md Section 13): each of the six ablation flags must move at
+    least one observable metric on SOME configuration, or the flag is
+    dead code / silently neutralised by another flag, exactly like the
+    B3 case that went undetected until the user asked for a direct check.
+    Uses a scarce, contended config (2 stations x 2 pads for 20 drones,
+    rate=1.2) so there is real contention for every mechanism to act on."""
+    stations = [(400.0, 400.0), (1600.0, 1600.0)]
+    base = dict(n_uavs=20, station_positions=stations, pads_per_station=2,
+                horizon_min=500, seed=3, mission_rate_per_min=1.2, drain_cap_min=100.0)
+
+    r_default = run_mission_sim(policy="ours", **base)
+    default_summary = _summary_metrics(r_default)
+
+    flips = [("use_queue_term", False), ("use_reservation", False), ("use_priority", False),
+              ("use_partial", False), ("use_jit", True), ("use_charge_time_term", False)]
+    for flag, value in flips:
+        r_flipped = run_mission_sim(policy="ours", **{**base, flag: value})
+        flipped_summary = _summary_metrics(r_flipped)
+        assert flipped_summary != default_summary, (
+            f"{flag}={value} changed NO observable metric vs default on this config "
+            f"({default_summary}) -- the flag may be a no-op here, the way "
+            f"use_reservation was under use_queue_term=False before the fix.")
