@@ -164,6 +164,7 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                      use_queue_term: bool = True, use_reservation: bool = True,
                      use_priority: bool = True, use_partial: bool = True,
                      use_jit: bool = False, use_charge_time_term: bool = True,
+                     use_proactive_trigger: bool = True,
                      initial_soc: float = 1.0, initial_positions: list = None,
                      drain_cap_min: float = 0.0,
                      alpha: float = 1.0, beta: float = 1.0, gamma: float = 1.0,
@@ -193,9 +194,19 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
     is accumulated per tick (not per whole session) since price varies with
     time of day within a single charging session.
     w1, w2, use_queue_term, use_reservation, use_priority, use_partial,
-    use_jit, use_charge_time_term: F11 weights and the six Section 3
-    ablation flags -- only meaningful for policy='ours'; passing any of
-    them away from its default with policy!='ours' raises ValueError.
+    use_jit, use_charge_time_term, use_proactive_trigger: F11 weights and
+    the seven ablation flags -- only meaningful for policy='ours'; passing
+    any of them away from its default with policy!='ours' raises ValueError.
+    use_proactive_trigger (added 2026-09-24, REMEDIATION.md Section 3's
+    original six-flag ablation set had a blind spot -- see CLAUDE.md
+    Section 13): Step 1's "needs a charging decision" check is
+    `soc <= RECHARGE_TRIGGER_SOC` OR (if this flag is True, the default)
+    the drone's next expected mission fails the reachability gate within
+    LOOKAHEAD_MIN. This proactive branch, not any of the original six
+    flags, was found to be the dominant driver of B3's underperformance
+    under scarce-station contention (F5's proactive demand pays off only
+    when F8's queue term can route around the congestion it creates).
+    Defaults True so every existing result stands unchanged.
     initial_soc, initial_positions: override the default (soc=1.0, random
     positions) starting state -- for controlled tests; available to every
     policy.
@@ -217,12 +228,13 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
     ours_only = dict(w1=w1, w2=w2, use_queue_term=use_queue_term, use_reservation=use_reservation,
                       use_priority=use_priority, use_partial=use_partial, use_jit=use_jit,
                       use_charge_time_term=use_charge_time_term,
+                      use_proactive_trigger=use_proactive_trigger,
                       f9_priority_insertion=f9_priority_insertion,
                       f9_lookahead_cap_min=f9_lookahead_cap_min)
     ours_only_defaults = dict(w1=1.0, w2=1.0, use_queue_term=True, use_reservation=True,
                                use_priority=True, use_partial=True, use_jit=False,
-                               use_charge_time_term=True, f9_priority_insertion=False,
-                               f9_lookahead_cap_min=None)
+                               use_charge_time_term=True, use_proactive_trigger=True,
+                               f9_priority_insertion=False, f9_lookahead_cap_min=None)
     if policy != "ours":
         bad = [k for k, v in ours_only.items() if v != ours_only_defaults[k]]
         if bad:
@@ -604,7 +616,7 @@ def run_mission_sim(n_uavs: int, station_positions: list, pads_per_station: int,
                 if uav.state != "IDLE" or uav.id in reservation:
                     continue
                 needs = uav.soc <= RECHARGE_TRIGGER_SOC
-                if not needs:
+                if not needs and use_proactive_trigger:
                     nm = _next_expected_mission(uav, missions, t, LOOKAHEAD_MIN)
                     if nm is not None:
                         ok, _ = _reachable_with_return(uav.position, nm.destination, uav.soc,

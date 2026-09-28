@@ -160,7 +160,8 @@ def test_every_ablation_flag_changes_observable_behaviour():
     default_summary = _summary_metrics(r_default)
 
     flips = [("use_queue_term", False), ("use_reservation", False), ("use_priority", False),
-              ("use_partial", False), ("use_jit", True), ("use_charge_time_term", False)]
+              ("use_partial", False), ("use_jit", True), ("use_charge_time_term", False),
+              ("use_proactive_trigger", False)]
     for flag, value in flips:
         r_flipped = run_mission_sim(policy="ours", **{**base, flag: value})
         flipped_summary = _summary_metrics(r_flipped)
@@ -168,3 +169,33 @@ def test_every_ablation_flag_changes_observable_behaviour():
             f"{flag}={value} changed NO observable metric vs default on this config "
             f"({default_summary}) -- the flag may be a no-op here, the way "
             f"use_reservation was under use_queue_term=False before the fix.")
+
+
+def test_use_proactive_trigger_explains_B3_underperformance_under_scarce_capacity():
+    """Regression for the 2026-09-24 root-cause finding (CLAUDE.md Section
+    13, "B3 vs baseline, root-caused"): B3 (use_queue_term=False) burns
+    ~7x more charging sessions/drone than baseline under scarce-station
+    contention, driven by F5's proactive lookahead trigger (Step 1) --
+    not partial charging, not a reservation bug. Disabling the trigger
+    alone should collapse B3's session count back toward baseline's."""
+    stations = [(400.0, 400.0), (1600.0, 1600.0)]  # 2 scarce stations, 2 pads each
+    base = dict(n_uavs=20, station_positions=stations, pads_per_station=2,
+                horizon_min=1000, seed=1, mission_rate_per_min=0.8, drain_cap_min=135.0)
+
+    r_baseline = run_mission_sim(policy="baseline", **base)
+    r_b3 = run_mission_sim(policy="ours", use_queue_term=False, **base)
+    r_b3_no_proactive = run_mission_sim(policy="ours", use_queue_term=False,
+                                          use_proactive_trigger=False, **base)
+
+    baseline_sessions = r_baseline["charge_sessions"] / 20
+    b3_sessions = r_b3["charge_sessions"] / 20
+    b3_no_proactive_sessions = r_b3_no_proactive["charge_sessions"] / 20
+
+    assert b3_sessions > 2 * baseline_sessions, (
+        "expected B3 to burn far more sessions/drone than baseline under scarce capacity "
+        f"(got B3={b3_sessions:.2f}, baseline={baseline_sessions:.2f})")
+    # Disabling the proactive trigger should pull B3's session count back
+    # down, much closer to baseline's than the full-proactive B3 is.
+    assert b3_no_proactive_sessions < b3_sessions, (
+        "disabling use_proactive_trigger should reduce B3's session count, "
+        f"got {b3_no_proactive_sessions:.2f} vs {b3_sessions:.2f}")
